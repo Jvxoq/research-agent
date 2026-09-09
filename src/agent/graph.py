@@ -1,38 +1,33 @@
-import os
-
-from loguru import logger
-from langchain_groq import ChatGroq
-from langchain_tavily import TavilySearch
-from agent.tools_and_schemas import SearchQueryList, Reflection, ResearchResponse
 from dotenv import load_dotenv
-from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
+from langchain_tavily import TavilySearch
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Send
+from loguru import logger
 
+from agent.configuration import Configuration
+from agent.llm import build_chat_model
+from agent.prompts import (
+    answer_instructions,
+    get_current_date,
+    query_writer_instructions,
+    reflection_instructions,
+    web_searcher_instructions,
+)
 from agent.state import (
     OverallState,
     QueryGenerationState,
     ReflectionState,
     WebSearchState,
 )
-from agent.configuration import Configuration
-from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
-    answer_instructions,
-)
-
+from agent.tools_and_schemas import Reflection, ResearchResponse, SearchQueryList
+from agent.tracing import configure_tracing
 from agent.utils import get_research_topic
 
 load_dotenv()
 
-if os.getenv("GROQ_API_KEY") is None:
-    raise ValueError("GROQ_API_KEY is not set")
 
 
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -56,12 +51,9 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
     # Init groq
-    llm = ChatGroq(
-        model=configurable.query_generator_model,
-        temperature=0.4,
-        max_retries=2,
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    configure_tracing(configurable)
+    llm = build_chat_model("query_generator", configurable)
+    structured_llm = llm.with_structured_output(SearchQueryList, method="json_schema")
 
     # Format the prompt
     current_date = get_current_date()
@@ -123,11 +115,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         include_images=False,
     )
 
-    llm = ChatGroq(
-        model=configurable.web_research_model,
-        temperature=0,
-        max_retries=1,
-    )
+    llm = build_chat_model("web_research", configurable)
 
     agent = create_react_agent(
         model=llm,
@@ -139,7 +127,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     response = agent.invoke({"messages": [HumanMessage(content=state["search_query"])]})
 
     # Structured Output Implementation
-    structured_llm = llm.with_structured_output(ResearchResponse)
+    structured_llm = llm.with_structured_output(ResearchResponse, method="json_schema")
     structured_response = structured_llm.invoke(response["messages"][-1].content)
 
     # Extract the search results from the agent's response
@@ -172,8 +160,6 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     configurable = Configuration.from_runnable_config(config)
     # Increment the research loop count and get the reasoning model
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reflection_model = state.get("reflection_model", configurable.reflection_model)
-    logger.info(f"reflection using model: {reflection_model}")
     # Format the prompt
     current_date = get_current_date()
     formatted_prompt = reflection_instructions.format(
@@ -182,13 +168,9 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGroq(
-        model=reflection_model,
-        temperature=1.0,
-        max_retries=2,
-    )
+    llm = build_chat_model("reflection", configurable)
 
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    result = llm.with_structured_output(Reflection, method="json_schema").invoke(formatted_prompt)
     logger.info(
         f"reflection result - is_sufficient: {result.is_sufficient}, knowledge_gap: {result.knowledge_gap}, follow_up_queries: {result.follow_up_queries}"
     )
@@ -257,7 +239,6 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     """
     logger.info("Node: finalize_answer")
     configurable = Configuration.from_runnable_config(config)
-    answer_model = state.get("answer_model") or configurable.answer_model
 
     # Format the prompt
     current_date = get_current_date()
@@ -268,11 +249,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     )
 
     # Init Reasoning Model
-    llm = ChatGroq(
-        model=answer_model,
-        temperature=0.1,
-        max_retries=2,
-    )
+    llm = build_chat_model("answer", configurable)
     result = llm.invoke(formatted_prompt)
     logger.info(f"finalize_answer result: {result.content[:100]}...")
     return {

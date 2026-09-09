@@ -28,3 +28,7 @@ venv/
 
 # Lock files (optional - uncomment if you want to commit uv.lock)
 # uv.lock
+
+# Benchmark output
+results/
+
