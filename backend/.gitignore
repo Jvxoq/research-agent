@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Environment
+.env
+.python-version
+
+# OS
+.DS_Store
+
+# Lock files (optional - uncomment if you want to commit uv.lock)
+# uv.lock
+# LangGraph Server scratch directory
+.langgraph_api/
+
+# Test coverage data
+.coverage

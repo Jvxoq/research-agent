@@ -1,0 +1,96 @@
+[project]
+name = "research-agent"
+version = "0.0.1"
+description = "Backend for the LangGraph agent"
+authors = [
+    { name = "Jason Daniel", email = "winjasdan2@gmail.com" },
+]
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "langgraph>=1.1.10",
+    "python-dotenv>=1.0.1",
+    "langgraph-sdk>=0.3.15",
+    "langgraph-cli>=0.4.31",
+    "langgraph-api>=0.13.4",
+    "pydantic-settings>=2.5.0",
+    "tavily-python>=0.7.23",
+    "langchain-tavily>=0.2.17",
+    "typing-extensions>=4.15.0",
+    "loguru>=0.7.3",
+    "langchain-openai>=1.6.1",
+    "openai>=2.0.0",
+    "httpx2>=2.12.0",
+    "aiohttp>=3.13.5",
+    "pyjwt>=2.10.0",
+]
+
+
+[project.optional-dependencies]
+dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
+
+[build-system]
+requires = ["setuptools>=73.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+lint.select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "D",    # pydocstyle
+    "D401", # First line should be in imperative mood
+    "T201",
+    "UP",
+]
+lint.ignore = [
+    "UP006",
+    "UP007",
+    # We actually do want to import from typing_extensions
+    "UP035",
+    # Relax the convention by _not_ requiring documentation for every function parameter.
+    "D417",
+    "E501",
+]
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "UP"]
+# The eval runners are command line programs. Their output is the point.
+"evals/*" = ["T201"]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.13"
+mypy_path = "src"
+strict = true
+# The provider integrations ship no stubs. Their own internals are not checked,
+# but every value crossing into this repository still is.
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "langgraph-cli[inmem]>=0.4.31",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Two test folders hold files that share a basename, for example
+# tests/unit/research_agent/conftest.py and tests/unit/research_agent_evals/conftest.py.
+# importlib mode names each module by its full path, so the two do not collide
+# and no directory needs an __init__.py.
+addopts = "--import-mode=importlib"
+# `evals` is a runner, not part of the shipped wheel, so it is not installed.
+# Putting the project root on the path lets tests import it.
+pythonpath = ["."]
+# A test with a missing timeout fails here instead of hanging CI.
+timeout = 30
+filterwarnings = [
+    "error",
+    # The graph is built with StateGraph(..., config_schema=Configuration). LangGraph 1.0
+    # deprecates the name, so graph.py raises this warning.
+    "ignore::langgraph.warnings.LangGraphDeprecatedSinceV10",
+]
