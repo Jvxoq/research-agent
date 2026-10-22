@@ -13,6 +13,7 @@ import asyncio
 import os
 import re
 import socket
+import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -25,6 +26,8 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import ToolException
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langchain_tavily import TavilyExtract, TavilySearch
+from langsmith.schemas import TracerSession
+from langsmith.types.run_get_url_response import RunGetURLResponse
 from loguru import logger
 
 from agents.research_agent.schemas import Decision, SearchAction
@@ -292,6 +295,31 @@ def decision(
     return Decision(report=report, answer=answer, action=action)
 
 
+TRACE_PROJECT_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
+
+
+def trace_page(project_id: object, trace_id: object, run_id: object) -> str:
+    """Return the page LangSmith names for one run of one trace."""
+    return f"https://smith.test/p/{project_id}/trace/{trace_id}/run/{run_id}"
+
+
+@dataclass
+class FakeRunsResource:
+    """Stands in for ``Client.runs``, the async API that names a run's page."""
+
+    error: Exception | None = None
+    lookups: list[dict[str, object]] = field(default_factory=list)
+
+    async def get_url(
+        self, run_id: str, *, project_id: str, trace_id: str, timeout: float
+    ) -> RunGetURLResponse:
+        """Record the lookup, then answer with the page or raise the set error."""
+        self.lookups.append({"run_id": run_id, "trace_id": trace_id, "timeout": timeout})
+        if self.error is not None:
+            raise self.error
+        return RunGetURLResponse(url=trace_page(project_id, trace_id, run_id))
+
+
 @dataclass
 class FakeLangSmithClient:
     """A LangSmith client that records how it was built and every run it is sent."""
@@ -299,6 +327,15 @@ class FakeLangSmithClient:
     api_url: str | None = None
     api_key: str | None = None
     created: list[dict[str, Any]] = field(default_factory=list)
+    builds: list[dict[str, Any]] = field(default_factory=list)
+    project_reads: list[str] = field(default_factory=list)
+    project_error: Exception | None = None
+    runs: FakeRunsResource = field(default_factory=FakeRunsResource)
+
+    def build(self, **settings: Any) -> FakeLangSmithClient:
+        """Record one construction, the way the runner builds its own client."""
+        self.builds.append(settings)
+        return self
 
     def create_run(self, **run: Any) -> None:
         """Record a run the tracer posts, the way LangSmith would store it."""
@@ -307,11 +344,30 @@ class FakeLangSmithClient:
     def update_run(self, run_id: Any, **run: Any) -> None:
         """Accept the tracer's end-of-run patch. Its metadata repeats the post."""
 
+    def read_project(self, *, project_name: str) -> TracerSession:
+        """Answer a blocking project read, which must run off the event loop."""
+        off_loop(None)()
+        self.project_reads.append(project_name)
+        if self.project_error is not None:
+            raise self.project_error
+        return TracerSession(
+            id=TRACE_PROJECT_ID, tenant_id=uuid.uuid4(), reference_dataset_id=None
+        )
+
 
 @pytest.fixture
 def langsmith_client(monkeypatch):
     """Replace the LangSmith client, whose constructor calls the network."""
     monkeypatch.setattr("core.tracing.Client", FakeLangSmithClient)
+
+
+@pytest.fixture
+def langsmith_fake(monkeypatch) -> FakeLangSmithClient:
+    """Replace every LangSmith client the tracer and the eval runner build."""
+    client = FakeLangSmithClient()
+    monkeypatch.setattr("core.tracing.Client", lambda **kwargs: client)
+    monkeypatch.setattr("evals.research_agent.run.Client", client.build)
+    return client
 
 
 @dataclass(frozen=True)
@@ -324,20 +380,18 @@ class TracedRun:
 
 
 @pytest.fixture
-def traced_runs(monkeypatch, set_env) -> Callable[[], list[TracedRun]]:
+def traced_runs(langsmith_fake, set_env) -> Callable[[], list[TracedRun]]:
     """Turn tracing on the way the operator does, and record every posted run.
 
     Returns:
         A callable that waits for the tracer and returns the runs posted so far.
     """
-    client = FakeLangSmithClient()
-    monkeypatch.setattr("core.tracing.Client", lambda **kwargs: client)
     set_env(LANGSMITH_TRACING="true", LANGSMITH_API_KEY="ls-test-key-not-used")
 
     def read() -> list[TracedRun]:
         wait_for_all_tracers()
         found = []
-        for run in client.created:
+        for run in langsmith_fake.created:
             metadata = (run.get("extra") or {}).get("metadata") or {}
             found.append(
                 TracedRun(

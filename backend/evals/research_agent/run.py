@@ -36,8 +36,9 @@ from typing import cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tracers.context import collect_runs
-from langchain_core.tracers.schemas import Run
+from langchain_core.utils.uuid import uuid7
+from langsmith import Client
+from langsmith import utils as ls_utils
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, TypedDict
@@ -45,7 +46,7 @@ from typing_extensions import NotRequired, TypedDict
 from agents.research_agent.configuration import ROLES, Configuration
 from agents.research_agent.graph import graph
 from agents.research_agent.state import ResearchAgentOutput, StopReason
-from core.config import get_settings
+from core.config import Settings, get_settings
 from core.llm import ModelSpec, build_chat_model
 from core.retry import COUNTERS_KEY, Retrier, RetryCounters
 from core.tracing import tracing
@@ -333,16 +334,69 @@ def append_line(path: Path, record: ResultLine) -> None:
         sink.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _trace_url(runs: list[Run]) -> str | None:
-    """Return the LangSmith URL of the collected root run, when there is one.
+@dataclass(frozen=True)
+class TraceLinks:
+    """Looks up the LangSmith page of each traced question run.
 
     Args:
-        runs: Runs collected around one ``ainvoke``.
+        client: The LangSmith client that answers the lookups.
+        project_id: The project the runs are traced to.
+        timeout_seconds: Ceiling on one lookup.
+    """
+
+    client: Client
+    project_id: str
+    timeout_seconds: float
+
+    async def url_for(self, run_id: uuid.UUID) -> str | None:
+        """Return the LangSmith URL of one question's root run.
+
+        Args:
+            run_id: The id the runner gave the question's ``ainvoke``.
+
+        Returns:
+            The trace URL, or None when the lookup failed. A failed lookup is
+            logged and never fails the question.
+        """
+        try:
+            # A root run is its own trace, so its id is also the trace id.
+            found = await self.client.runs.get_url(
+                str(run_id),
+                project_id=self.project_id,
+                trace_id=str(run_id),
+                timeout=self.timeout_seconds,
+            )
+        except Exception:
+            logger.exception(f"no trace URL for run {run_id}")
+            return None
+        return found.url
+
+
+async def trace_links(settings: Settings, timeout_seconds: float) -> TraceLinks | None:
+    """Resolve the traced project once, so each question needs one lookup only.
+
+    Args:
+        settings: Process settings holding the LangSmith variables.
+        timeout_seconds: Ceiling on each LangSmith request.
 
     Returns:
-        The trace URL, or None when tracing recorded none.
+        The lookup, or None when the project cannot be read. The run then
+        records no trace URLs but still runs.
     """
-    return getattr(runs[0], "url", None) if runs else None
+    client = Client(
+        api_url=settings.LANGSMITH_ENDPOINT,
+        api_key=settings.LANGSMITH_API_KEY,
+        timeout_ms=int(timeout_seconds * 1000),
+    )
+    # tracing() hands LangSmith the same name, and LangSmith falls back to
+    # its own default project when the name is unset.
+    project_name = settings.LANGSMITH_PROJECT or ls_utils.get_tracer_project()
+    try:
+        project = await asyncio.to_thread(client.read_project, project_name=project_name)
+    except Exception:
+        logger.exception(f"cannot read LangSmith project {project_name}; no trace URLs")
+        return None
+    return TraceLinks(client, str(project.id), timeout_seconds)
 
 
 def build_result(
@@ -421,6 +475,7 @@ def build_result(
 def failed_result(
     row: Row | GoldenRow, args: argparse.Namespace, config: Configuration,
     seconds: float, counters: RetryCounters, accountant: RunAccountant,
+    trace_url: str | None,
 ) -> ResultLine:
     """Assemble the JSON line for a question whose run raised.
 
@@ -431,6 +486,7 @@ def failed_result(
         seconds: Wall clock before the failure.
         counters: What the failed attempt waited for, per retry family.
         accountant: What the failed attempt spent before it raised.
+        trace_url: The failed run's trace, when tracing recorded one.
 
     Returns:
         A result record with ``stop_reason`` set to ``"error"``, so the next
@@ -443,7 +499,7 @@ def failed_result(
         state={"stop_reason": "error"},
         verdict=None,
         seconds=seconds,
-        trace_url=None,
+        trace_url=trace_url,
         counters=counters,
         accountant=accountant,
     )
@@ -454,6 +510,7 @@ async def run_question(
     args: argparse.Namespace,
     config: Configuration,
     judge: BaseChatModel,
+    links: TraceLinks | None,
 ) -> ResultLine:
     """Run and grade one question, recording a failure rather than raising.
 
@@ -465,6 +522,7 @@ async def run_question(
         args: Parsed command line arguments.
         config: The run configuration.
         judge: The chat model acting as judge.
+        links: Looks up the trace URL, or None when tracing is off.
 
     Returns:
         One result record, whether the run succeeded or failed.
@@ -474,26 +532,33 @@ async def run_question(
     # A new thread per attempt, so a retried question lands in its own
     # LangSmith thread, apart from the attempt that failed.
     thread_id = str(uuid.uuid4())
+    # Named here rather than read back from the tracer, which also reports
+    # model calls that start their own trace.
+    run_id = uuid7()
     started = time.monotonic()
+    final: dict[str, object] | None = None
     try:
-        with collect_runs() as collector:
-            # The graph counts tokens only. The accountant prices every call
-            # and joins it to its round, so no dollars live in the graph.
-            final = await graph.ainvoke(
-                {"question": row.question},
-                config={
-                    "run_name": f"{args.benchmark}-{row.question_id}",
-                    "metadata": config.run_metadata(question_id=row.question_id),
-                    "tags": config.run_tags(args.benchmark),
-                    "callbacks": [accountant],
-                    "configurable": {COUNTERS_KEY: counters, "thread_id": thread_id},
-                    "recursion_limit": config.max_rounds * 2 + 10,
-                },
-            )
+        # The graph counts tokens only. The accountant prices every call
+        # and joins it to its round, so no dollars live in the graph.
+        final = await graph.ainvoke(
+            {"question": row.question},
+            config={
+                "run_name": f"{args.benchmark}-{row.question_id}",
+                "run_id": run_id,
+                "metadata": config.run_metadata(question_id=row.question_id),
+                "tags": config.run_tags(args.benchmark),
+                "callbacks": [accountant],
+                "configurable": {COUNTERS_KEY: counters, "thread_id": thread_id},
+                "recursion_limit": config.max_rounds * 2 + 10,
+            },
+        )
     except Exception:
         logger.exception(f"{row.question_id} failed")
+    # A run that raised is traced too, and its trace is the one worth reading.
+    trace_url = await links.url_for(run_id) if links else None
+    if final is None:
         return failed_result(
-            row, args, config, time.monotonic() - started, counters, accountant
+            row, args, config, time.monotonic() - started, counters, accountant, trace_url
         )
 
     # ainvoke types its return as a plain dict. The graph's output schema is
@@ -533,7 +598,7 @@ async def run_question(
         state=state,
         verdict=verdict,
         seconds=time.monotonic() - started,
-        trace_url=_trace_url(collector.traced_runs),
+        trace_url=trace_url,
         counters=counters,
         accountant=accountant,
     )
@@ -548,6 +613,7 @@ async def _run_and_write(
     lock: asyncio.Lock,
     out_path: Path,
     budget: Budget,
+    links: TraceLinks | None,
 ) -> ResultLine | None:
     """Run one question behind the concurrency bound and append its line.
 
@@ -560,6 +626,7 @@ async def _run_and_write(
         lock: Serialises writes to the results file.
         out_path: The results file.
         budget: What the runs may still spend. Charged with this question's cost.
+        links: Looks up the trace URL, or None when tracing is off.
 
     Returns:
         The result record that was written, or None when the budget was spent
@@ -568,7 +635,7 @@ async def _run_and_write(
     async with semaphore:
         if budget.exhausted():
             return None
-        result = await run_question(row, args, config, judge)
+        result = await run_question(row, args, config, judge, links)
         # Charged before the slot is released, so the next question to take
         # it already sees this one's spend.
         budget.charge(result["usd"])
@@ -810,11 +877,16 @@ async def main(argv: list[str] | None = None) -> int:
 
         semaphore = asyncio.Semaphore(max(1, args.max_concurrency))
         lock = asyncio.Lock()
+        links = (
+            await trace_links(get_settings(), config.tool_timeout_seconds)
+            if traced
+            else None
+        )
 
         written = await asyncio.gather(
             *(
                 _run_and_write(
-                    row, args, config, judge, semaphore, lock, out_path, budget
+                    row, args, config, judge, semaphore, lock, out_path, budget, links
                 )
                 for row in pending
             )

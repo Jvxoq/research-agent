@@ -2,7 +2,11 @@
 
 import json
 
+import httpx2
 import pytest
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith import APIConnectionError, APITimeoutError, NotFoundError
+from langsmith.utils import LangSmithNotFoundError
 
 from agents.research_agent.graph import graph as agent_graph
 from core.config import get_settings
@@ -17,15 +21,19 @@ from evals.research_agent.run import (
     subset_results,
 )
 from tests.conftest import (
+    TRACE_PROJECT_ID,
     AlwaysWrongJudge,
     CountingGraph,
     FakeChatModel,
     FakeGraph,
+    FakeLangSmithClient,
     FakeSearch,
     GoldenJudge,
     Raises,
     TracedRun,
     decision,
+    logged,
+    trace_page,
     traced_judge,
 )
 
@@ -1057,3 +1065,156 @@ async def test_golden_judge_carries_thread(golden_setup, traced_runs, run_golden
     ]
 
     assert judged == [(True, True)] * len(GOLDEN_ROWS)
+
+
+# The pages LangSmith names for a traced pass, from the root run of each question.
+
+
+def root_pages(fake: FakeLangSmithClient) -> dict[str, str]:
+    """Return the page of each question's root run, keyed by question id."""
+    wait_for_all_tracers()
+    return {
+        run["name"].removeprefix("frames-"): trace_page(TRACE_PROJECT_ID, run["id"], run["id"])
+        for run in fake.created
+        if run["name"].startswith("frames-")
+    }
+
+
+def trace_urls(out_path) -> dict[str, str | None]:
+    """Return the trace URL each result line recorded, keyed by question id."""
+    return {line["question_id"]: line["trace_url"] for line in result_lines(out_path)}
+
+
+def lookup_error(kind: str) -> Exception:
+    """Build the error the LangSmith runs API raises, with its real class."""
+    request = httpx2.Request("GET", "https://api.smith.test/runs/url")
+    if kind == "timeout":
+        return APITimeoutError(request=request)
+    if kind == "connection":
+        return APIConnectionError(request=request)
+    return NotFoundError(
+        "run not found", response=httpx2.Response(404, request=request), body=None
+    )
+
+
+async def test_line_records_trace_url(traced_pass, langsmith_fake, out_path) -> None:
+    """A result line with no trace link cannot be checked by anyone who reads it."""
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert trace_urls(out_path) == root_pages(langsmith_fake)
+
+
+async def test_failed_line_records_trace_url(traced_pass, langsmith_fake, out_path) -> None:
+    """A run that raised is the one whose trace someone needs to read."""
+    await traced_pass([Raises(ValueError("bad request"))])
+
+    assert trace_urls(out_path) == root_pages(langsmith_fake)
+
+
+@pytest.mark.parametrize("kind", ["timeout", "connection", "not_found"])
+async def test_lookup_error_records_no_url(
+    traced_pass, langsmith_fake, out_path, rows, kind
+) -> None:
+    langsmith_fake.runs.error = lookup_error(kind)
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert trace_urls(out_path) == {row.question_id: None for row in rows}
+
+
+async def test_lookup_error_keeps_answers(traced_pass, langsmith_fake, out_path) -> None:
+    """A missing link is a missing link, never a lost result."""
+    langsmith_fake.runs.error = lookup_error("timeout")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert [line["stop_reason"] for line in result_lines(out_path)] == ["answer"] * 3
+
+
+async def test_lookup_error_logged(
+    traced_pass, langsmith_fake, log_records, out_path
+) -> None:
+    langsmith_fake.runs.error = lookup_error("timeout")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert logged(log_records) == [
+        ("ERROR", f"no trace URL for run {run_id}", True)
+        for run_id in sorted(lookup["run_id"] for lookup in langsmith_fake.runs.lookups)
+    ]
+
+
+async def test_unreadable_project_records_no_url(
+    traced_pass, langsmith_fake, out_path, rows
+) -> None:
+    langsmith_fake.project_error = LangSmithNotFoundError("Project default not found")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert trace_urls(out_path) == {row.question_id: None for row in rows}
+
+
+async def test_unreadable_project_logged(traced_pass, langsmith_fake, log_records) -> None:
+    langsmith_fake.project_error = LangSmithNotFoundError("Project default not found")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert logged(log_records) == [
+        ("ERROR", "cannot read LangSmith project default; no trace URLs", True)
+    ]
+
+
+async def test_project_read_once_per_pass(traced_pass, langsmith_fake, set_env) -> None:
+    """One project read per question would cost a request per question."""
+    set_env(LANGSMITH_PROJECT="evals")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert langsmith_fake.project_reads == ["evals"]
+
+
+async def test_one_lookup_per_question(traced_pass, langsmith_fake, rows) -> None:
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert len(langsmith_fake.runs.lookups) == len(rows)
+
+
+async def test_one_client_per_pass(traced_pass, langsmith_fake) -> None:
+    """A client per question opens a connection pool per question."""
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert len(langsmith_fake.builds) == 1
+
+
+async def test_lookup_timeout_from_config(traced_pass, langsmith_fake, set_env) -> None:
+    """The SDK call is the last stop before the network, so its timeout is the guard."""
+    set_env(TOOL_TIMEOUT_SECONDS="7.5")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert {lookup["timeout"] for lookup in langsmith_fake.runs.lookups} == {7.5}
+
+
+async def test_project_read_timeout_from_config(traced_pass, langsmith_fake, set_env) -> None:
+    set_env(TOOL_TIMEOUT_SECONDS="7.5")
+
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert [build["timeout_ms"] for build in langsmith_fake.builds] == [7500]
+
+
+async def test_tracing_off_builds_no_client(
+    working_setup, langsmith_fake, install, scripted_agent, out_path, rows
+) -> None:
+    scripted_agent([decision("r", answer="Paris")])
+    install(agent_graph, traced_judge())
+
+    await run_main(out_path, len(rows))
+
+    assert langsmith_fake.builds == []
+
+
+async def test_traced_pass_logs_no_warning(traced_pass, log_records) -> None:
+    await traced_pass([decision("r", answer="Paris")])
+
+    assert logged(log_records) == []
