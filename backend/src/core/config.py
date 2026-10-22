@@ -28,8 +28,10 @@ class Settings(BaseSettings):
     # `langgraph dev` sets ENVIRONMENT=development in .env.
     ENVIRONMENT: str = "production"
 
-    # Search
+    # Search. The endpoint is set here only, because whoever names it receives
+    # the key. A load test points it at a local fake.
     TAVILY_API_KEY: str | None = None
+    TAVILY_BASE_URL: str | None = None
 
     # Default endpoint. It chooses the provider.
     BASE_URL: str | None = None

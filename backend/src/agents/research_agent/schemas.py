@@ -19,6 +19,10 @@ class FinishedThread(ValueError):
     """Raised when a run starts on a thread whose research already ended."""
 
 
+class MissingThread(ValueError):
+    """Raised when a run starts with no ``thread_id`` in its configuration."""
+
+
 class SearchAction(BaseModel):
     """Search the web for one batch of queries."""
 

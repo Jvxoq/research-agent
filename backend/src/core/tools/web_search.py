@@ -53,6 +53,7 @@ async def search(
     deadline_seconds: float,
     retrier: Retrier,
     api_key: str | None = None,
+    base_url: str | None = None,
 ) -> tuple[list[str], list[str | None]]:
     """Search the web for a batch of queries.
 
@@ -67,6 +68,7 @@ async def search(
             failures. A timeout is a transient failure.
         api_key: Tavily credential. None lets the integration read its own
             environment variable, which only a server-hosted run has.
+        base_url: Tavily endpoint. None uses the integration's own default.
 
     Returns:
         Results and errors, one entry per query, in the order given. A query
@@ -77,6 +79,7 @@ async def search(
         max_results=max_results,
         include_images=False,
         **({"tavily_api_key": api_key} if api_key else {}),
+        **({"api_base_url": base_url} if base_url else {}),
     )
     semaphore = asyncio.Semaphore(concurrency)
 

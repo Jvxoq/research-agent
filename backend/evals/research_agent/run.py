@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import cast
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tracers.context import collect_runs
 from langchain_core.tracers.schemas import Run
 from loguru import logger
@@ -91,6 +93,12 @@ class ResultLine(TypedDict):
     # finished, and a resumed pass does not pay for that question again.
     transient_retries: NotRequired[int]
     transient_wait_seconds: NotRequired[float]
+    # Kept so a claim in the answer can be checked against the sourced facts
+    # in the report, and a failed tool target counted against all of them.
+    answer: NotRequired[str | None]
+    report: NotRequired[str | None]
+    tool_targets: NotRequired[int]
+    tool_target_errors: NotRequired[int]
     # Written on golden set lines only, which a benchmark grader never fills.
     missing_facts: NotRequired[list[str]]
     claims_made: NotRequired[list[str]]
@@ -364,8 +372,9 @@ def build_result(
 
     Returns:
         The result record, holding the fields spec.md section 8.4 names plus
-        ``judge_error``. A golden verdict adds the facts the report missed and
-        the wrong claims it made.
+        ``judge_error``, the answer, the final report and the run's tool target
+        and tool error counts. A golden verdict adds the facts the report
+        missed and the wrong claims it made.
     """
     per_round = accountant.rounds()
     if isinstance(verdict, Verdict):
@@ -390,6 +399,10 @@ def build_result(
         "rate_limit_wait_seconds": round(counters.rate_limit_wait_seconds, 3),
         "transient_retries": counters.transient_retries,
         "transient_wait_seconds": round(counters.transient_wait_seconds, 3),
+        "answer": state.get("answer"),
+        "report": state.get("report"),
+        "tool_targets": sum(r.get("tool_targets", 0) for r in per_round),
+        "tool_target_errors": sum(r.get("tool_target_errors", 0) for r in per_round),
         "malformed_summaries": counters.malformed_summaries,
         "reasoning_effort": config.reasoning_effort_for("think"),
         "answer_style": config.answer_style,
@@ -458,6 +471,9 @@ async def run_question(
     """
     counters = RetryCounters()
     accountant = RunAccountant()
+    # A new thread per attempt, so a retried question lands in its own
+    # LangSmith thread, apart from the attempt that failed.
+    thread_id = str(uuid.uuid4())
     started = time.monotonic()
     try:
         with collect_runs() as collector:
@@ -470,7 +486,7 @@ async def run_question(
                     "metadata": config.run_metadata(question_id=row.question_id),
                     "tags": config.run_tags(args.benchmark),
                     "callbacks": [accountant],
-                    "configurable": {COUNTERS_KEY: counters},
+                    "configurable": {COUNTERS_KEY: counters, "thread_id": thread_id},
                     "recursion_limit": config.max_rounds * 2 + 10,
                 },
             )
@@ -485,6 +501,9 @@ async def run_question(
     state = cast(ResearchAgentOutput, final)
 
     retrier = Retrier(policy=config.backoff_policy(), counters=counters)
+    judge_config = RunnableConfig(
+        metadata={"thread_id": thread_id, "question_id": row.question_id}
+    )
     verdict: Verdict | GoldenVerdict | JudgeFailure
     if isinstance(row, GoldenRow):
         verdict = await judge_report(
@@ -495,6 +514,7 @@ async def run_question(
             wrong_claims=row.wrong_claims,
             retrier=retrier,
             max_error_chars=config.max_error_chars,
+            config=judge_config,
         )
     else:
         verdict = await grade(
@@ -504,6 +524,7 @@ async def run_question(
             correct_answer=row.answer,
             retrier=retrier,
             max_error_chars=config.max_error_chars,
+            config=judge_config,
         )
     return build_result(
         row=row,

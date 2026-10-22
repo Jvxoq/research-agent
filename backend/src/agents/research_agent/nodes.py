@@ -31,6 +31,7 @@ from agents.research_agent.schemas import (
     Decision,
     FinishedThread,
     MalformedDecision,
+    MissingThread,
     SearchAction,
     trim_action,
 )
@@ -96,6 +97,7 @@ STOP_LIMITS = {
 
 # A fixed message, because the caller reads it back over the API.
 FINISHED_THREAD = "This thread already finished its research. Start a new thread."
+MISSING_THREAD = "A run needs a thread_id. Start it on a thread."
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,25 @@ def _render_observation_slot(
     if configuration.carry_full_history:
         return _render_history(state.get("history", []))
     return _render_observation(state.get("observation"))
+
+
+def _tool_target_counts(observation: Observation | None) -> tuple[int, int]:
+    """Count the targets of the tool batch a round read, and those that failed.
+
+    Every round after the first reads exactly one batch, the one the previous
+    ``act`` wrote, so summing these over a run's rounds counts each batch once.
+
+    Args:
+        observation: The last tool batch, or None in the first round.
+
+    Returns:
+        The number of search queries or URLs in the batch, and how many of them
+        ended in an error.
+    """
+    if observation is None:
+        return 0, 0
+    errors = observation["errors"]
+    return len(errors), sum(1 for error in errors if error is not None)
 
 
 def _build_workspace(state: ResearchAgentState, configuration: Configuration) -> str:
@@ -333,9 +354,17 @@ async def think(
         usage and retry totals, and a stop reason when the run must end.
 
     Raises:
+        MissingThread: The configuration names no ``thread_id``.
         FinishedThread: The thread already holds a finished run. Its report,
             round and usage belong to another question.
     """
+    # LangChain copies a configurable thread_id onto every traced child run,
+    # and LangSmith groups a run's calls into one thread by it. A run without
+    # one scatters its calls across the project.
+    thread_id = config.get("configurable", {}).get("thread_id")
+    if not thread_id:
+        raise MissingThread(MISSING_THREAD)
+
     # A run only reaches think while stop_reason is unset, so a set one means a
     # new run started on a thread whose research already ended.
     if state.get("stop_reason") is not None:
@@ -413,6 +442,7 @@ async def think(
         logger.error(f"no valid decision after retries: {last_error}")
         return await _stop_run(state, "malformed", this_round, malformed)
 
+    tool_targets, tool_target_errors = _tool_target_counts(state.get("observation"))
     record: RoundRecord = {
         "round": round_index,
         "prompt_chars": len(prompt),
@@ -420,6 +450,8 @@ async def think(
         "observation_chars": len(_render_observation_slot(state, configuration)),
         "action_name": decision.action.name if isinstance(decision, Acting) else None,
         "malformed_retries": malformed,
+        "tool_targets": tool_targets,
+        "tool_target_errors": tool_target_errors,
     }
 
     update: ResearchAgentUpdate = {
@@ -503,6 +535,7 @@ async def _stop_run(
     answer: str | None = None
     if reason == "malformed":
         answer = await _answer_in_plain_text(state, this_round)
+    tool_targets, tool_target_errors = _tool_target_counts(state.get("observation"))
     record: RoundRecord = {
         "round": this_round.index,
         "prompt_chars": this_round.prompt_chars,
@@ -512,6 +545,8 @@ async def _stop_run(
         ),
         "action_name": None,
         "malformed_retries": malformed,
+        "tool_targets": tool_targets,
+        "tool_target_errors": tool_target_errors,
     }
     return {
         "answer": (
@@ -566,6 +601,7 @@ async def act(
             timeout_seconds=configuration.tool_timeout_seconds,
             deadline_seconds=configuration.target_deadline_seconds,
             api_key=get_settings().TAVILY_API_KEY,
+            base_url=get_settings().TAVILY_BASE_URL,
             retrier=retrier,
         )
     else:
@@ -581,6 +617,7 @@ async def act(
                 timeout_seconds=configuration.tool_timeout_seconds,
                 deadline_seconds=configuration.target_deadline_seconds,
                 api_key=get_settings().TAVILY_API_KEY,
+                base_url=get_settings().TAVILY_BASE_URL,
             ),
             summariser=build_chat_model(configuration.model_spec_for("look_up")),
             prompt_template=LOOK_UP_PROMPT,

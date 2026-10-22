@@ -24,8 +24,15 @@ from tests.conftest import (
     FakeSearch,
     GoldenJudge,
     Raises,
+    TracedRun,
     decision,
+    traced_judge,
 )
+
+# Every run LangSmith receives for one question answered in round 0: the graph
+# under its run name, its node, the model call inside it, the router, and the
+# judge that grades the answer.
+QUESTION_RUN_NAMES = ("frames-q1", "think", "chat_model", "route_after_think", "judge")
 
 # spec.md section 8.4. A result line holds these and nothing else.
 RESULT_FIELDS = {
@@ -52,6 +59,10 @@ RESULT_FIELDS = {
     "model",
     "trace_url",
     "per_round",
+    "answer",
+    "report",
+    "tool_targets",
+    "tool_target_errors",
 }
 
 
@@ -324,6 +335,82 @@ async def test_raising_question_records_spend(
         1200,
         0.00025,
     )
+
+
+async def test_line_sums_tool_targets(
+    working_setup, wire, scripted_agent, out_path
+):
+    """tool_call_success_rate is tool_target_errors over tool_targets, per run."""
+    scripted_agent(
+        [
+            decision("r", queries=["q1", "q2"]),
+            decision("r", queries=["q3"]),
+            decision("r", answer="Paris"),
+        ],
+        search=FakeSearch(
+            batches=[(["hit", ""], [None, "Search failed."]), ([""], ["Search failed."])]
+        ),
+    )
+
+    _, lines = await wire(agent_graph, out_path)
+
+    assert (lines[0]["tool_targets"], lines[0]["tool_target_errors"]) == (3, 2)
+
+
+async def test_line_saves_answer(working_setup, wire, scripted_agent, out_path):
+    scripted_agent([decision("the final report", answer="Paris")])
+
+    _, lines = await wire(agent_graph, out_path)
+
+    assert lines[0]["answer"] == "Paris"
+
+
+async def test_line_saves_final_report(working_setup, wire, scripted_agent, out_path):
+    """Groundedness checks the answer against the sourced facts in this report."""
+    scripted_agent([decision("the final report", answer="Paris")])
+
+    _, lines = await wire(agent_graph, out_path)
+
+    assert lines[0]["report"] == "the final report"
+
+
+async def test_failed_line_saves_no_answer(
+    working_setup, wire, scripted_agent, out_path
+):
+    """A run that raised wrote no answer, so none may be scored as one."""
+    scripted_agent(
+        [decision("r", queries=["q"])],
+        search=FakeSearch(error=RuntimeError("search is down")),
+    )
+
+    _, lines = await wire(agent_graph, out_path)
+
+    assert (lines[0]["answer"], lines[0]["report"]) == (None, None)
+
+
+async def test_resume_skips_line_without_tool_counts(
+    working_setup, wire, rows, out_path, correct_graph, earlier_line
+):
+    """A line from before the tool counts existed must not be paid for again."""
+    old_round = {
+        "round": 0,
+        "prompt_chars": 10,
+        "report_chars": 1,
+        "observation_chars": 0,
+        "action_name": None,
+        "malformed_retries": 0,
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "usd": 0.001,
+    }
+    out_path.write_text(
+        earlier_line(rows[0].question_id, per_round=[old_round]), encoding="utf-8"
+    )
+
+    await wire(correct_graph, out_path)
+
+    asked = {config["run_name"] for config in correct_graph.configs}
+    assert f"frames-{rows[0].question_id}" not in asked
 
 
 async def test_line_spend_matches_runner(
@@ -888,3 +975,85 @@ async def test_gate_refused_on_benchmark(
     code = await run_main(out_path, len(rows), ["--gate"])
 
     assert (code, out_path.exists()) == (1, False)
+
+
+def threads_by_question(runs: list[TracedRun]) -> dict[str, set[str | None]]:
+    """Group the thread ids LangSmith received by the question each run names."""
+    threads: dict[str, set[str | None]] = {}
+    for run in runs:
+        if run.question_id is not None:
+            threads.setdefault(run.question_id, set()).add(run.thread_id)
+    return threads
+
+
+@pytest.fixture
+def traced_pass(working_setup, traced_runs, install, scripted_agent, out_path, rows):
+    """Return a helper that runs one traced pass of the real graph and judge.
+
+    Returns:
+        A callable taking the agent's scripted replies and returning every run
+        LangSmith received so far.
+    """
+
+    async def run(replies: list[object]) -> list[TracedRun]:
+        scripted_agent(replies)
+        install(agent_graph, traced_judge())
+        await run_main(out_path, len(rows))
+        return traced_runs()
+
+    return run
+
+
+async def test_question_runs_share_thread(traced_pass, rows) -> None:
+    """LangSmith shows one question as one thread only when every run agrees."""
+    runs = await traced_pass([decision("r", answer="Paris")])
+
+    sizes = {question: len(ids) for question, ids in threads_by_question(runs).items()}
+
+    assert sizes == {row.question_id: 1 for row in rows}
+
+
+async def test_question_runs_never_threadless(traced_pass) -> None:
+    runs = await traced_pass([decision("r", answer="Paris")])
+
+    assert [run.name for run in runs if run.question_id and not run.thread_id] == []
+
+
+async def test_questions_get_distinct_threads(traced_pass, rows) -> None:
+    runs = await traced_pass([decision("r", answer="Paris")])
+
+    threads = set().union(*threads_by_question(runs).values())
+
+    assert len(threads) == len(rows)
+
+
+async def test_judge_joins_question_thread(traced_pass, rows) -> None:
+    """A grade read apart from the run it graded cannot be checked."""
+    runs = await traced_pass([decision("r", answer="Paris")])
+    (thread,) = threads_by_question(runs)[rows[0].question_id]
+
+    names = sorted(run.name for run in runs if run.thread_id == thread)
+
+    assert names == sorted(QUESTION_RUN_NAMES)
+
+
+async def test_retried_question_gets_new_thread(traced_pass, rows) -> None:
+    """A retry filed under the failed attempt's thread hides which attempt scored."""
+    await traced_pass([Raises(ValueError("bad request"))])
+    runs = await traced_pass([decision("r", answer="Paris")])
+
+    sizes = {question: len(ids) for question, ids in threads_by_question(runs).items()}
+
+    assert sizes == {row.question_id: 2 for row in rows}
+
+
+async def test_golden_judge_carries_thread(golden_setup, traced_runs, run_golden) -> None:
+    await run_golden([checklist([True, True], [False]), checklist([True], [])])
+
+    judged = [
+        (run.question_id is not None, run.thread_id is not None)
+        for run in traced_runs()
+        if run.name == "golden_judge"
+    ]
+
+    assert judged == [(True, True)] * len(GOLDEN_ROWS)

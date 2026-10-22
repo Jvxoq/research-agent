@@ -82,6 +82,7 @@ def run_search(retrier: Retrier):
         timeout_seconds: float = 5.0,
         deadline_seconds: float = 60.0,
         api_key: str | None = None,
+        base_url: str | None = None,
     ):
         return await web_search.search(
             queries,
@@ -91,6 +92,7 @@ def run_search(retrier: Retrier):
             deadline_seconds=deadline_seconds,
             retrier=retrier,
             api_key=api_key,
+            base_url=base_url,
         )
 
     return run
@@ -236,3 +238,17 @@ async def test_returned_rate_limit_retried(
 
     assert (results[0], errors[0]) == (_rendered(QUERIES[0]), None)
     assert retrier.counters.rate_limit_hits == 1
+
+
+async def test_search_calls_given_endpoint(tavily_endpoints, run_search) -> None:
+    """A load test points search at a local fake. The client must call it, not Tavily."""
+    await run_search(QUERIES[:1], api_key="tvly-test", base_url="http://fakes.test:8790")
+
+    assert tavily_endpoints == ["http://fakes.test:8790"]
+
+
+async def test_search_defaults_to_tavily(tavily_endpoints, run_search) -> None:
+    """With no endpoint set, the client keeps Tavily's own address."""
+    await run_search(QUERIES[:1], api_key="tvly-test")
+
+    assert tavily_endpoints == [None]

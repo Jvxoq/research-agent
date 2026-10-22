@@ -12,7 +12,8 @@ import pytest
 
 from agents.research_agent.nodes import act
 from core.retry import COUNTERS_KEY, RetryCounters
-from tests.conftest import FakeLookUp, FakeSearch
+from core.tools.web_look_up import PageSummary
+from tests.conftest import PUBLIC_ADDRESS, FakeChatModel, FakeLookUp, FakeSearch
 
 
 @pytest.fixture
@@ -166,3 +167,43 @@ async def test_summary_failures_reach_state_totals(
     update = await act({**look_up_state, "retries": spent}, config)
 
     assert update["retries"]["malformed_summaries"] == 3
+
+
+@pytest.fixture
+def real_tools(monkeypatch, resolves, set_env) -> None:
+    """Run the real tools on fake Tavily clients, with a key from the environment."""
+    set_env(TAVILY_API_KEY="tvly-test")
+    resolves(default=PUBLIC_ADDRESS)
+    summary = PageSummary(
+        findings=["founded 1893"], source_date="unknown", coverage="FULL", coverage_note=""
+    )
+    monkeypatch.setattr(
+        "agents.research_agent.nodes.build_chat_model",
+        lambda spec: FakeChatModel(structured_replies=[summary]),
+    )
+
+
+@pytest.mark.parametrize("state_name", ["search_state", "look_up_state"])
+async def test_tools_call_env_endpoint(
+    request, real_tools, tavily_endpoints, set_env, config, state_name
+) -> None:
+    """A served run reads the Tavily endpoint from the environment, as the load test sets it."""
+    set_env(TAVILY_BASE_URL="http://fakes.test:8790")
+
+    await act(request.getfixturevalue(state_name), config)
+
+    assert set(tavily_endpoints) == {"http://fakes.test:8790"}
+
+
+@pytest.mark.parametrize("state_name", ["search_state", "look_up_state"])
+async def test_request_cannot_set_endpoint(
+    request, real_tools, tavily_endpoints, config, state_name
+) -> None:
+    """Whoever names the endpoint receives the Tavily key, so a caller never names it."""
+    config["configurable"].update(
+        {"tavily_base_url": "http://attacker.test", "TAVILY_BASE_URL": "http://attacker.test"}
+    )
+
+    await act(request.getfixturevalue(state_name), config)
+
+    assert set(tavily_endpoints) == {None}

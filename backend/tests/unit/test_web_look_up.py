@@ -503,3 +503,27 @@ async def test_returned_rate_limit_retried(
 
     assert (batch.results[0], batch.errors[0]) == (_rendered_found(URLS[0]), None)
     assert retrier.counters.rate_limit_hits == 1
+
+
+async def test_look_up_calls_given_endpoint(
+    tavily_endpoints, summariser: FakeChatModel, settings: LookUpSettings, retrier: Retrier
+) -> None:
+    """A load test points extract at a local fake. The client must call it, not Tavily."""
+    pointed = dataclasses.replace(
+        settings, api_key="tvly-test", base_url="http://fakes.test:8790"
+    )
+
+    await look_up([URLS[0]], pointed, summariser, PROMPT_TEMPLATE, retrier, {})
+
+    assert tavily_endpoints == ["http://fakes.test:8790"]
+
+
+async def test_look_up_defaults_to_tavily(
+    tavily_endpoints, summariser: FakeChatModel, settings: LookUpSettings, retrier: Retrier
+) -> None:
+    """With no endpoint set, the client keeps Tavily's own address."""
+    keyed = dataclasses.replace(settings, api_key="tvly-test")
+
+    await look_up([URLS[0]], keyed, summariser, PROMPT_TEMPLATE, retrier, {})
+
+    assert tavily_endpoints == [None]

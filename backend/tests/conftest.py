@@ -9,25 +9,35 @@ one thing drift, and a test that passes against a stale fake proves nothing.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import pytest
 from langchain_core.callbacks import AsyncCallbackManager
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import LLMResult
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import ToolException
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langchain_tavily import TavilyExtract, TavilySearch
+from loguru import logger
 
 from agents.research_agent.schemas import Decision, SearchAction
 from core.config import Settings, get_settings
 from core.llm import reset_rate_limiter
 from core.retry import COUNTERS_KEY, BackoffPolicy, Retrier
+from core.tools import web_look_up, web_search
 from core.tools.web_look_up import LookUpBatch
+from loadtest.scenario import ModelRequest, Scenario
 from tests.structure.conftest import configuration_classes
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 # Every field any agent can configure. A variable left in the developer's shell
 # would otherwise win over a test's own configuration, silently.
@@ -76,6 +86,7 @@ def clean_environment(monkeypatch):
         "JWT_AUDIENCE",
         "ENVIRONMENT",
         "MODEL_PRICES_USD_PER_MTOK",
+        "TAVILY_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("LLM_API_KEY", "test-key-not-used")
@@ -162,7 +173,7 @@ class FakeChatModel:
             inheritable_callbacks=config.get("callbacks"),
             inheritable_metadata=config.get("metadata"),
         )
-        runs = await manager.on_chat_model_start({}, [[]])
+        runs = await manager.on_chat_model_start({}, [[]], name="chat_model")
         result = LLMResult(
             generations=[[]],
             llm_output={
@@ -283,16 +294,61 @@ def decision(
 
 @dataclass
 class FakeLangSmithClient:
-    """A LangSmith client that records how it was built and sends nothing."""
+    """A LangSmith client that records how it was built and every run it is sent."""
 
     api_url: str | None = None
     api_key: str | None = None
+    created: list[dict[str, Any]] = field(default_factory=list)
+
+    def create_run(self, **run: Any) -> None:
+        """Record a run the tracer posts, the way LangSmith would store it."""
+        self.created.append(run)
+
+    def update_run(self, run_id: Any, **run: Any) -> None:
+        """Accept the tracer's end-of-run patch. Its metadata repeats the post."""
 
 
 @pytest.fixture
 def langsmith_client(monkeypatch):
     """Replace the LangSmith client, whose constructor calls the network."""
     monkeypatch.setattr("core.tracing.Client", FakeLangSmithClient)
+
+
+@dataclass(frozen=True)
+class TracedRun:
+    """One run as LangSmith files it: its name and the thread keys it carries."""
+
+    name: str
+    question_id: str | None
+    thread_id: str | None
+
+
+@pytest.fixture
+def traced_runs(monkeypatch, set_env) -> Callable[[], list[TracedRun]]:
+    """Turn tracing on the way the operator does, and record every posted run.
+
+    Returns:
+        A callable that waits for the tracer and returns the runs posted so far.
+    """
+    client = FakeLangSmithClient()
+    monkeypatch.setattr("core.tracing.Client", lambda **kwargs: client)
+    set_env(LANGSMITH_TRACING="true", LANGSMITH_API_KEY="ls-test-key-not-used")
+
+    def read() -> list[TracedRun]:
+        wait_for_all_tracers()
+        found = []
+        for run in client.created:
+            metadata = (run.get("extra") or {}).get("metadata") or {}
+            found.append(
+                TracedRun(
+                    name=run["name"],
+                    question_id=metadata.get("question_id"),
+                    thread_id=metadata.get("thread_id"),
+                )
+            )
+        return found
+
+    return read
 
 
 PUBLIC_ADDRESS = "93.184.216.34"
@@ -476,6 +532,11 @@ class ContainmentJudge:
         )
 
 
+def traced_judge() -> RunnableLambda[Any, AIMessage]:
+    """Return the containment judge as a runnable, so LangSmith traces its calls."""
+    return RunnableLambda(ContainmentJudge().ainvoke, name="judge")
+
+
 class AlwaysWrongJudge:
     """A judge that calls everything incorrect, including the known answers."""
 
@@ -518,6 +579,141 @@ class GoldenJudge(ContainmentJudge):
 
     def with_structured_output(
         self, schema: Any, method: str = "json_schema", include_raw: bool = True
-    ) -> FakeStructuredModel:
-        """Return the scripted structured path."""
-        return self.structured.with_structured_output(schema, method, include_raw)
+    ) -> RunnableLambda[str, Any]:
+        """Return the scripted structured path as a runnable, so LangSmith traces it."""
+        scripted = self.structured.with_structured_output(schema, method, include_raw)
+        return RunnableLambda(scripted.ainvoke, name="golden_judge")
+
+
+@dataclass
+class PeakGauge:
+    """Hold every call open until the test opens the gate, and count them."""
+
+    in_flight: int = 0
+    peak: int = 0
+    gate: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def hold(self) -> None:
+        """Count this call in, wait for the gate, then count it out."""
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await self.gate.wait()
+        finally:
+            self.in_flight -= 1
+
+
+async def settle(rounds: int = 100) -> None:
+    """Run every ready task until it blocks. Fakes do no I/O, so this ends."""
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+def off_loop(answer: object) -> Callable[..., object]:
+    """Return a fake sync function that fails on the event loop thread."""
+
+    def fake(*args: object, **kwargs: object) -> object:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return answer
+        raise AssertionError("a blocking call ran on the event loop thread")
+
+    return fake
+
+
+async def hang(*args: object, **kwargs: object) -> NoReturn:
+    """Never answer, like a dependency that stopped responding."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+@pytest.fixture
+def log_records() -> Iterator[list[Record]]:
+    """Collect every loguru record the test produces."""
+    records: list[Record] = []
+    sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    yield records
+    logger.remove(sink)
+
+
+def logged(records: list[Record], min_level: int = 30) -> list[tuple[str, str, bool]]:
+    """Return level name, message and whether an exception is attached."""
+    return [
+        (record["level"].name, record["message"], record["exception"] is not None)
+        for record in records
+        if record["level"].no >= min_level
+    ]
+
+
+@pytest.fixture
+def tavily_endpoints(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+    """Build the real Tavily client each tool asks for, and record its endpoint.
+
+    The real client is the last object before the network, so the endpoint it
+    holds is where its request would go. None means Tavily's own default. A
+    fake answers in its place, so nothing leaves the process.
+    """
+    endpoints: list[str | None] = []
+
+    async def answer_search(query: str) -> dict[str, object]:
+        return {"results": [{"title": "t", "url": "https://example.com/a", "content": "c"}]}
+
+    async def answer_extract(url: str) -> dict[str, object]:
+        return {"results": [{"url": url, "raw_content": "page text"}]}
+
+    def search_tool(**kwargs: Any) -> FakeSearchTool:
+        endpoints.append(TavilySearch(**kwargs).api_wrapper.api_base_url)
+        return FakeSearchTool(answer_search)
+
+    def extract_tool(**kwargs: Any) -> FakeExtractor:
+        endpoints.append(TavilyExtract(**kwargs).apiwrapper.api_base_url)
+        return FakeExtractor(answer_extract)
+
+    monkeypatch.setattr(web_search, "TavilySearch", search_tool)
+    monkeypatch.setattr(web_look_up, "TavilyExtract", extract_tool)
+    return endpoints
+
+
+@dataclass
+class ScenarioStructured:
+    """The structured path of :class:`ScenarioChatModel`, for one schema."""
+
+    model: ScenarioChatModel
+    schema: Any
+
+    async def ainvoke(self, prompt: str, config: Any = None) -> dict[str, Any]:
+        """Answer from the scenario and parse it the way the provider's schema would."""
+        content = self.model.answer(self.schema.__name__, prompt)
+        return {
+            "raw": AIMessage(content=content),
+            "parsed": self.schema.model_validate_json(content),
+            "parsing_error": None,
+        }
+
+
+@dataclass
+class ScenarioChatModel:
+    """A chat model that answers the way the load test's fake provider does.
+
+    It hands the real prompt and schema name to a load scenario's ``reply``,
+    so a test proves the scenario can drive the real graph.
+    """
+
+    scenario: Scenario
+    schemas: list[str | None] = field(default_factory=list)
+
+    def answer(self, schema_name: str | None, prompt: str) -> str:
+        """Record the schema and return the scenario's reply."""
+        self.schemas.append(schema_name)
+        return self.scenario.reply(ModelRequest("fake", schema_name, prompt))
+
+    def with_structured_output(
+        self, schema: Any, method: str = "json_schema", include_raw: bool = True
+    ) -> ScenarioStructured:
+        """Return the structured path for one schema."""
+        return ScenarioStructured(model=self, schema=schema)
+
+    async def ainvoke(self, prompt: str, config: Any = None) -> AIMessage:
+        """Answer a plain-text call."""
+        return AIMessage(content=self.answer(None, prompt))
