@@ -25,5 +25,6 @@ def config() -> dict[str, Any]:
     return {
         "configurable": {
             "current_date_override": "2026-01-02",
+            "thread_id": "thread-unit",
         }
     }

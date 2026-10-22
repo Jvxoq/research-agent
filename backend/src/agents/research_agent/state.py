@@ -14,7 +14,7 @@ from __future__ import annotations
 import operator
 from typing import Literal
 
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import Annotated, NotRequired, TypedDict
 
 from core.cost import UsageTotals
 from core.retry import RetryTotals
@@ -64,6 +64,10 @@ class RoundRecord(TypedDict):
     observation_chars: int
     action_name: str | None
     malformed_retries: int
+    # The tool batch this round read, one count per search query or URL.
+    # Optional so a result line written before these fields existed still reads.
+    tool_targets: NotRequired[int]
+    tool_target_errors: NotRequired[int]
 
 
 class ResearchAgentInput(TypedDict):

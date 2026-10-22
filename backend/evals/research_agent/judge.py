@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel
 
@@ -118,6 +119,7 @@ async def grade(
     correct_answer: str,
     retrier: Retrier,
     max_error_chars: int,
+    config: RunnableConfig | None = None,
 ) -> Verdict | JudgeFailure:
     """Ask the judge whether one answer matches the gold answer.
 
@@ -129,6 +131,8 @@ async def grade(
         retrier: Backoff policy and counters for rate limits and transient
             failures. The judge's SDK retries nothing itself.
         max_error_chars: Ceiling on the error a failure records.
+        config: Run configuration for the judge call, so its trace joins the
+            thread of the run it grades.
 
     Returns:
         The judge's verdict, or a failure when the call raised or the reply
@@ -140,7 +144,7 @@ async def grade(
     )
     try:
         reply = await retrier.run(
-            lambda: judge.ainvoke([HumanMessage(content=prompt)]), "judge"
+            lambda: judge.ainvoke([HumanMessage(content=prompt)], config=config), "judge"
         )
     except Exception as error:
         logger.exception("judge call failed")
@@ -353,6 +357,7 @@ async def judge_report(
     wrong_claims: list[str],
     retrier: Retrier,
     max_error_chars: int,
+    config: RunnableConfig | None = None,
 ) -> GoldenVerdict | JudgeFailure:
     """Ask the judge which facts and wrong claims one report contains.
 
@@ -365,6 +370,8 @@ async def judge_report(
         retrier: Backoff policy and counters for rate limits and transient
             failures.
         max_error_chars: Ceiling on the error a failure records.
+        config: Run configuration for the judge call, so its trace joins the
+            thread of the run it grades.
 
     Returns:
         The verdict, or a failure when the call raised or the judge's answers
@@ -391,7 +398,7 @@ async def judge_report(
     # A transport failure, a reply cut off by the provider, a schema mismatch
     # and a skipped item all leave the report ungraded, so each is a failure.
     try:
-        result = await retrier.run(lambda: structured.ainvoke(prompt), "golden_judge")
+        result = await retrier.run(lambda: structured.ainvoke(prompt, config=config), "golden_judge")
         return _verdict(read_structured(result, Judgement), required_facts, wrong_claims)
     except Exception as error:
         logger.exception("golden judge gave no usable verdict")

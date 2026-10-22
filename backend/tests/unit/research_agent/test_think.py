@@ -8,13 +8,19 @@ private helper.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import pytest
 from openai import ContentFilterFinishReasonError
 
-from agents.research_agent.nodes import think
-from agents.research_agent.schemas import Answered, Decision, FinishedThread
+from agents.research_agent.nodes import MISSING_THREAD, think
+from agents.research_agent.schemas import (
+    Answered,
+    Decision,
+    FinishedThread,
+    MissingThread,
+)
 from core.config import get_settings
 from tests.conftest import Raises, decision
 
@@ -847,3 +853,86 @@ async def test_finished_thread_refuses_without_model_call(
         await think(finished, config)
 
     assert model.prompts == []
+
+
+@pytest.fixture
+def threadless(config) -> dict[str, Any]:
+    """Return a run configuration that names every setting except a thread."""
+    return {
+        "configurable": {
+            key: value
+            for key, value in config["configurable"].items()
+            if key != "thread_id"
+        }
+    }
+
+
+@pytest.mark.parametrize("thread_id", [None, ""], ids=["absent", "blank"])
+async def test_missing_thread_raises(
+    chat_model, patch_model, threadless, question, answering, thread_id
+) -> None:
+    """LangSmith groups a run's calls by thread_id, so a run without one is lost."""
+    patch_model(chat_model(structured_replies=[answering]))
+    if thread_id is not None:
+        threadless["configurable"]["thread_id"] = thread_id
+
+    with pytest.raises(MissingThread, match=f"^{re.escape(MISSING_THREAD)}"):
+        await think({"question": question}, threadless)
+
+
+async def test_missing_thread_skips_model(
+    chat_model, patch_model, threadless, question, answering
+) -> None:
+    """A refused run spends nothing."""
+    model = chat_model(structured_replies=[answering])
+    patch_model(model)
+
+    with pytest.raises(MissingThread):
+        await think({"question": question}, threadless)
+
+    assert model.prompts == []
+
+
+@pytest.fixture
+def partly_failed() -> dict[str, Any]:
+    """A previous search batch of three queries whose middle query failed."""
+    return {
+        "call": {"name": "search", "queries": ["a", "b", "c"]},
+        "results": ["first hit", "", "third hit"],
+        "errors": [None, "Search failed.", None],
+        "capped": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("reply", "limits"),
+    [
+        (decision("r", answer="1893"), {}),
+        (ValueError("Invalid JSON"), {"max_decision_retries": 0}),
+        (Raises(TimeoutError("provider timed out")), {"max_retries": 0}),
+    ],
+    ids=["answered", "malformed_stop", "transport_stop"],
+)
+async def test_round_record_counts_tool_targets(
+    chat_model, patch_model, config, question, partly_failed, no_backoff_wait,
+    reply, limits,
+) -> None:
+    """tool_call_success_rate is read from these counts, on every way a round ends."""
+    patch_model(chat_model(structured_replies=[reply]))
+    config["configurable"].update(limits)
+
+    update = await think({"question": question, "observation": partly_failed}, config)
+
+    record = update["per_round"]
+    assert (record["tool_targets"], record["tool_target_errors"]) == (3, 1)
+
+
+async def test_first_round_counts_no_targets(
+    chat_model, patch_model, config, question, answering
+) -> None:
+    patch_model(chat_model(structured_replies=[answering]))
+
+    update = await think({"question": question}, config)
+
+    record = update["per_round"]
+    assert (record["tool_targets"], record["tool_target_errors"]) == (0, 0)

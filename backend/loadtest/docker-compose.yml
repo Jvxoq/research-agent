@@ -1,0 +1,36 @@
+# Merged over the stack `langgraph up` builds, with
+#   uv run langgraph up -d loadtest/docker-compose.yml --wait
+# A key here beats the same key in `.env`, so the server under load calls the
+# local fakes, never a paid provider, and keeps production auth on.
+#
+# The load runner parses this file for the fake port and the JWT settings, so
+# each value lives here once.
+services:
+  langgraph-api:
+    extra_hosts:
+      # Docker Desktop names the host already. Linux Docker needs this line.
+      - "host.docker.internal:host-gateway"
+    environment:
+      ENVIRONMENT: production
+      # Most runs the server executes at once. LangGraph Server defaults to 10
+      # and queues the rest, so a load test at the default measures the queue,
+      # not the agent. 50 matches the 50-user SLO level. Production needs the
+      # same variable set in Render's env, or it keeps the default of 10.
+      N_JOBS_PER_WORKER: "50"
+      BASE_URL: http://host.docker.internal:8790/v1
+      THINK_BASE_URL: http://host.docker.internal:8790/v1
+      LOOK_UP_BASE_URL: http://host.docker.internal:8790/v1
+      TAVILY_BASE_URL: http://host.docker.internal:8790
+      # Placeholders, so a real key from .env never reaches the fakes.
+      LLM_API_KEY: loadtest-placeholder
+      TAVILY_API_KEY: loadtest-placeholder
+      # Thousands of runs would flood the LangSmith project. The server still
+      # reads LANGSMITH_API_KEY from .env for its license check.
+      LANGSMITH_TRACING: "false"
+      # A test-only signing key for a local container. The runner signs one
+      # token per simulated user with it, so every run passes real JWT checks
+      # and stays scoped to its own user.
+      JWT_SECRET: loadtest-only-signing-key-not-used-anywhere-else
+      JWT_ALGORITHM: HS256
+      JWT_ISSUER: loadtest
+      JWT_AUDIENCE: loadtest

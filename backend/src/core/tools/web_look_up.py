@@ -99,6 +99,7 @@ class LookUpSettings:
     timeout_seconds: float
     deadline_seconds: float
     api_key: str | None = None
+    base_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -218,7 +219,8 @@ async def look_up(
         errors list.
     """
     extractor = TavilyExtract(
-        **({"tavily_api_key": settings.api_key} if settings.api_key else {})
+        **({"tavily_api_key": settings.api_key} if settings.api_key else {}),
+        **({"api_base_url": settings.base_url} if settings.base_url else {}),
     )
     # include_raw hands a parsing failure back as a value, so a schema message
     # quoting a word like "connection" never reads as a transient network error.

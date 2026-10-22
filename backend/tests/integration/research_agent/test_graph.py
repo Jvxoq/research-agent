@@ -7,17 +7,28 @@ agent has quietly become a growing-context loop.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.research_agent.graph import build_graph, graph
-from agents.research_agent.nodes import FINISHED_THREAD
-from agents.research_agent.schemas import Answered, Decision, FinishedThread
+from agents.research_agent.nodes import FINISHED_THREAD, MISSING_THREAD
+from agents.research_agent.schemas import (
+    Answered,
+    Decision,
+    FinishedThread,
+    MissingThread,
+)
+from core.config import get_settings
+from core.tracing import tracing
 from tests.conftest import FakeChatModel, FakeSearch, decision
 
 QUESTION = "In what year was the observatory founded?"
+
+# Every run LangSmith receives for three rounds: the graph, its nodes and its router.
+TRACED_NAMES = ("research-agent", "think", "act", "route_after_think")
 
 
 @pytest.fixture
@@ -64,6 +75,7 @@ def config() -> dict[str, Any]:
         "configurable": {
             "current_date_override": "2026-01-02",
             "max_rounds": 6,
+            "thread_id": "thread-integration",
         }
     }
 
@@ -199,6 +211,27 @@ async def test_finished_thread_refuses_question(
     assert len(model.prompts) == calls_after_first_run
 
 
+async def test_graph_refuses_without_thread(run_graph, config, three_round_script) -> None:
+    run_graph(three_round_script)
+    del config["configurable"]["thread_id"]
+
+    with pytest.raises(MissingThread, match=f"^{re.escape(MISSING_THREAD)}"):
+        await graph.ainvoke({"question": "When was it founded?"}, config)
+
+
+async def test_every_traced_run_carries_thread(
+    traced_runs, run_graph, config, three_round_script
+) -> None:
+    """LangSmith files a run under a thread only when the run itself names it."""
+    run_graph(three_round_script)
+
+    with tracing(get_settings()):
+        await graph.ainvoke({"question": "When was it founded?"}, config)
+
+    assert {run.name: run.thread_id for run in traced_runs()} == {
+        name: "thread-integration" for name in TRACED_NAMES
+    }
+
 async def test_input_round_cannot_extend_limit(
     run_graph, config, to_the_limit
 ) -> None:
@@ -209,3 +242,4 @@ async def test_input_round_cannot_extend_limit(
     final = await graph.ainvoke({"question": QUESTION, "round": -100}, config)
 
     assert (final["stop_reason"], final["round"]) == ("max_rounds", 3)
+
