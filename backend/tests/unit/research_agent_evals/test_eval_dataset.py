@@ -177,6 +177,13 @@ def test_golden_avoids_measured_rows(golden_lines):
     assert rows & MEASURED_FRAMES_ROWS == set()
 
 
+def test_golden_lines_list_wrong_claims(golden_lines):
+    """hallucination_rate counts wrong claims made, so a line with none can never count."""
+    bare = [line.id for line in golden_lines if not line.wrong_claims]
+
+    assert bare == []
+
+
 def test_golden_reads_checklist(tmp_path):
     path = write_golden(tmp_path, GOLDEN_LINE, "", {**GOLDEN_LINE, "id": "g02"})
 
