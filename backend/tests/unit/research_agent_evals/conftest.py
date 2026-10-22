@@ -6,7 +6,8 @@ the judge model and the dataset loader are all replaced.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from typing import Any
 
 import pytest
 from loguru import logger
@@ -51,3 +52,34 @@ def rows() -> list[Row]:
 def judge() -> ContainmentJudge:
     """Return a judge that grades the known-answer set exactly right."""
     return ContainmentJudge()
+
+
+# What a scripted agent does for one question, returning its final state.
+Script = Callable[[str], Awaitable[dict[str, object]]]
+
+
+class ScriptedAgent:
+    """Stands in for the compiled graph, acting out one script per question."""
+
+    def __init__(self, script: Script) -> None:
+        self.questions: list[str] = []
+        self.script = script
+
+    async def ainvoke(self, state: dict[str, Any], config: Any = None) -> dict[str, object]:
+        """Record the question, run the script for it and return its final state."""
+        self.questions.append(state["question"])
+        return await self.script(state["question"])
+
+
+@pytest.fixture
+def scripted_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[str, Script], ScriptedAgent]:
+    """Return a helper that replaces one eval module's graph with a scripted agent."""
+
+    def install(module: str, script: Script) -> ScriptedAgent:
+        agent = ScriptedAgent(script)
+        monkeypatch.setattr(f"{module}.graph", agent)
+        return agent
+
+    return install
