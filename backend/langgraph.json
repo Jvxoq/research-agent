@@ -1,0 +1,13 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "research_agent": "./src/agents/research_agent/graph.py:graph"
+  },
+  "env": ".env",
+  "python_version": "3.13",
+  "auth": {
+    "path": "./src/core/auth.py:auth"
+  }
+}
