@@ -7,6 +7,18 @@ more than the last. This agent rebuilds its workspace every round from three thi
 the question, an evolving report, and the last step. The prompt stays flat however
 many rounds a run takes.
 
+## Results
+
+- **95% on FRAMES at $0.0019 per question.** 19 of 20 questions, `zai-org/GLM-5.3-Flash`,
+  subset seed 0. Twenty questions is a demonstration, not a benchmark score.
+- **3.9 times smaller prompt.** On one BrowseComp question, at round 8, the full-history
+  arm sends 14,005 prompt tokens and the evolving report sends 3,562.
+- **Trace:** [a passing FRAMES run](https://smith.langchain.com/public/635c6443-0c07-4fb4-b128-ffdadd18d845/r).
+  A failing run's trace is not published yet.
+
+Live-web scores can run up to 4 points high, because the agent can find benchmark
+answers online (arXiv 2606.05241).
+
 ## How it works
 
 ```
@@ -46,7 +58,8 @@ backend/
   tests/unit/                 # each node called as a plain function, mocked model
   tests/integration/          # the compiled graph, network mocked
   tests/structure/            # ast checks that enforce the layout and import rules
-  evals/research_agent/       # benchmark runner, judges, golden set, cost accounting
+  evals/research_agent/       # benchmark runner, judges, golden set, safety evals
+  loadtest/                   # server load test against a fake model and fake search
 docs/                         # charts built from eval results
 ```
 
@@ -105,7 +118,8 @@ ANSWER_STYLE=report uv run python -m evals.research_agent.run --benchmark golden
 ```
 
 `--benchmark` takes `browsecomp`, `frames` or `golden`. The golden set is 30 FRAMES
-questions, each graded against a checklist of required facts. Each question writes one
+questions, each graded against the facts it must contain and the wrong claims it must
+not make. Each question writes one
 JSON line with its verdict, rounds, tokens, dollars and per-round prompt size. A second
 pass over the same `--out` file skips finished questions.
 
@@ -114,6 +128,20 @@ question. The running report stays near 3,000 tokens a round. Full history climb
 over 13,000.
 
 ![Prompt tokens per round](docs/m7_prompt_tokens.png)
+
+## When things go wrong
+
+- **Load.** `backend/loadtest/` runs LangGraph Server in Docker against a fake model
+  and fake Tavily, then checks the speed targets in `SLO.md`. At 50 users it served
+  545 runs a minute with a 1.5 s p95 time to first token.
+- **Prompt injection.** `backend/evals/research_agent/injection.py` serves pages with
+  hidden instructions. 0 of 29 exposed cases changed what the agent did.
+- **Jailbreaks.** `backend/evals/research_agent/jailbreak.py` sends 300 JailbreakBench
+  prompts and grades each answer with a judge. It is built and tested, but not yet run
+  against a real model.
+- **Release gate.** `run.py --gate` fails when the golden set pass rate drops more than
+  10 points below `baseline.json`, which holds 29 of 30. The `Golden gate` workflow
+  runs it by hand only, because every run costs money.
 
 ## Checks
 
