@@ -9,5 +9,13 @@
   "python_version": "3.13",
   "auth": {
     "path": "./src/core/auth.py:auth"
+  },
+  "http": {
+    "disable_assistants": true,
+    "disable_store": true,
+    "disable_ui": true,
+    "disable_mcp": true,
+    "disable_a2a": true,
+    "disable_webhooks": true
   }
 }
