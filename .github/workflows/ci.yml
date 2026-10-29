@@ -40,3 +40,83 @@ jobs:
           TAVILY_API_KEY: test-tavily-key
           ENVIRONMENT: test
         run: uv run pytest
+
+  image:
+    name: Image (build, push on main)
+    needs: backend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: backend/.python-version
+
+      - name: Install dependencies
+        run: uv sync
+
+      # GHCR refuses upper-case names, and the owner name has one.
+      - name: Name the image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # langgraph.json pins the server version and installs from uv.lock, so
+      # the image runs the versions the tests above ran against.
+      - name: Build
+        run: uv run langgraph build --tag "$IMAGE:$GITHUB_SHA"
+
+      # The build's own install step can still move a version, so check the
+      # image itself, not the config that built it.
+      - name: Check the image runs the locked versions
+        run: |
+          docker run --rm -i --entrypoint python "$IMAGE:$GITHUB_SHA" - <<'EOF'
+          import importlib.metadata as metadata
+
+          from packaging.requirements import Requirement
+
+          # The generated Dockerfile deletes setuptools once the install is done.
+          REMOVED_BY_BUILD = {"setuptools"}
+
+          drift = []
+          for line in open("/lock/pins.txt"):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              pin = Requirement(line)
+              if pin.name in REMOVED_BY_BUILD:
+                  continue
+              if pin.marker and not pin.marker.evaluate():
+                  continue
+              (locked,) = pin.specifier
+              try:
+                  installed = metadata.version(pin.name)
+              except metadata.PackageNotFoundError:
+                  installed = "missing"
+              if installed != locked.version:
+                  drift.append(f"{pin.name}: uv.lock {locked.version}, image {installed}")
+          print("\n".join(drift) or "image matches uv.lock")
+          raise SystemExit(1 if drift else 0)
+          EOF
+
+      # Render deploys the `main` tag. The commit tag stays, so a rollback is a
+      # deploy of an older commit's image.
+      - name: Push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:main"
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:main"
