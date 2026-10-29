@@ -1,0 +1,48 @@
+# Render Blueprint for the LangGraph Server. CI builds the image and pushes it
+# to GHCR. This file names every variable the service reads and holds no value:
+# `sync: false` makes Render ask for each one when the Blueprint is first
+# applied, and later changes happen in Render's environment.
+services:
+  - type: web
+    name: research-agent
+    runtime: image
+    image:
+      url: ghcr.io/jvxoq/research-agent:main
+      # A Render registry credential holding a GHCR token with read:packages.
+      creds:
+        fromRegistryCreds:
+          name: ghcr
+    healthCheckPath: /ok
+    envVars:
+      # Read by LangGraph Server itself.
+      - key: DATABASE_URI
+        sync: false
+      - key: REDIS_URI
+        sync: false
+      # Unset, the server runs 10 runs at once. The load test chose 50.
+      - key: N_JOBS_PER_WORKER
+        sync: false
+      # Read by core/config.py. LangGraph Server also reads LANGSMITH_API_KEY
+      # for its license check.
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_TRACING
+        sync: false
+      - key: LANGSMITH_PROJECT
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: THINK_MODEL
+        sync: false
+      - key: LOOK_UP_MODEL
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ISSUER
+        sync: false
+      - key: JWT_AUDIENCE
+        sync: false

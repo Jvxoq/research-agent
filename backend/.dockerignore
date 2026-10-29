@@ -1,0 +1,7 @@
+# `langgraph build` copies this whole folder into the image, and .env here holds
+# real keys. Refuse everything, then let in only what the install needs.
+*
+!pyproject.toml
+!uv.lock
+!src/
+**/__pycache__
