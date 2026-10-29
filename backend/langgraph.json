@@ -7,7 +7,7 @@
   },
   "env": ".env",
   "python_version": "3.13",
-  "api_version": "0.13.4",
+  "api_version": "0.16.9",
   "dockerfile_lines": [
     "COPY pyproject.toml uv.lock /lock/",
     "RUN uv export --project /lock --frozen --no-dev --no-emit-project --no-hashes --output-file /lock/pins.txt",
